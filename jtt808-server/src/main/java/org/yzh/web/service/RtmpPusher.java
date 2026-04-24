@@ -33,6 +33,7 @@ public class RtmpPusher {
     private static final int MSG_USER_CTRL      = 4;
     private static final int MSG_WIN_ACK_SIZE   = 5;
     private static final int MSG_SET_PEER_BW    = 6;
+    private static final int MSG_AUDIO          = 8;
     private static final int MSG_VIDEO          = 9;
     private static final int MSG_DATA_AMF0      = 18; // 0x12
     private static final int MSG_CMD_AMF0       = 20; // 0x14
@@ -297,6 +298,45 @@ public class RtmpPusher {
         log.info("RTMP视频帧 ts={}ms(raw={}) keyframe={} avcc={}B 源前16B={}",
                 relativeTs, timestampMs, keyframe, avcc.size(),
                 bytesToHex(annexBFrame, 0, Math.min(16, annexBFrame.length)));
+    }
+
+    // ======================================================
+    // 音频推流（仅 G.711A/G.711U，其它编码暂不支持）
+    //
+    // FLV AudioTag 格式（首字节）：
+    //   soundFormat(4) | soundRate(2) | soundSize(1) | soundType(1)
+    //   soundFormat: 7=G.711A, 8=G.711U, 10=AAC
+    //   对 G.711 而言，soundRate/Size/Type 字段被解码器忽略，固定 8kHz/mono
+    // ======================================================
+
+    public synchronized void pushAudio(byte[] data, int jtPt, long timestampMs) throws Exception {
+        if (out == null) return;
+        if (data == null || data.length == 0) return;
+
+        // 时间戳共用同一个基准，保证音视频同步
+        if (firstTimestampMs < 0) firstTimestampMs = timestampMs;
+        long relativeTs = timestampMs - firstTimestampMs;
+        if (relativeTs < 0) relativeTs = 0;
+        if (relativeTs > 0xFFFFFFL) relativeTs = 0xFFFFFFL;
+
+        int flvAudioHeader;
+        switch (jtPt) {
+            case 6:  flvAudioHeader = 0x72; break; // G.711A: soundFormat=7
+            case 7:  flvAudioHeader = 0x82; break; // G.711U: soundFormat=8
+            default:
+                log.warn("不支持的音频编码 PT={}，跳过（当前仅支持 G.711A/G.711U）", jtPt);
+                return;
+        }
+
+        // FLV AudioTag body = [header(1B)] [raw audio data]
+        byte[] body = new byte[1 + data.length];
+        body[0] = (byte) flvAudioHeader;
+        System.arraycopy(data, 0, body, 1, data.length);
+
+        // 使用独立 chunk stream id（6）避免和视频(4)相互阻塞
+        sendChunk(6, (int) relativeTs, MSG_AUDIO, msgStreamId, body);
+        out.flush();
+        log.info("RTMP音频帧 ts={}ms(raw={}) pt={} size={}B", relativeTs, timestampMs, jtPt, data.length);
     }
 
     private void sendAvcSequenceHeader(int timestamp) throws Exception {

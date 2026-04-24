@@ -50,8 +50,11 @@ public class JTProperties {
         private boolean rtmp;
         /** ZLMediaKit RTMP 端口（默认 1935） */
         private int zlmRtmpPort = 1935;
-        /** RTMP 流名（播放地址中的 streamId） */
-        private String streamName = "jt1078";
+        /**
+         * RTMP 流名模板，支持占位符：{client_id}、{channel_no}
+         * 首个 JT1078 包到达后会替换为实际值，例："{client_id}/{channel_no}" → "101260130082/1"
+         */
+        private String streamName = "{client_id}/{channel_no}";
 
         public int getPublicPort() {
             return publicPort > 0 ? publicPort : 27078;

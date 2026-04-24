@@ -23,25 +23,27 @@ public class RTMPJTStreamServer {
     private final int            port;
     private final String         zlmHost;
     private final int            zlmRtmpPort;
-    private final String         streamName;
+    /** 流名模板，支持 {client_id} / {channel_no} 占位符 */
+    private final String         streamNameTemplate;
     private final SessionManager sessionManager;
 
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
 
     /**
-     * @param port           本服务监听端口（设备连接此端口上传 JT1078 视频）
-     * @param zlmHost        ZLMediaKit 地址
-     * @param zlmRtmpPort    ZLMediaKit RTMP 端口（默认 1935）
-     * @param streamName     RTMP 流名（播放 URL 中的 streamId）
-     * @param sessionManager JT808 会话管理器（用于向设备发送 T9105 心跳）
+     * @param port               本服务监听端口（设备连接此端口上传 JT1078 视频）
+     * @param zlmHost            ZLMediaKit 地址
+     * @param zlmRtmpPort        ZLMediaKit RTMP 端口（默认 1935）
+     * @param streamNameTemplate RTMP 流名模板，支持 {client_id} / {channel_no} 占位符
+     *                           例：{client_id}/{channel_no} 会解析为如 "101260130082/1"
+     * @param sessionManager     JT808 会话管理器（用于向设备发送 T9105 心跳）
      */
-    public RTMPJTStreamServer(int port, String zlmHost, int zlmRtmpPort, String streamName, SessionManager sessionManager) {
-        this.port           = port;
-        this.zlmHost        = zlmHost;
-        this.zlmRtmpPort    = zlmRtmpPort;
-        this.streamName     = streamName;
-        this.sessionManager = sessionManager;
+    public RTMPJTStreamServer(int port, String zlmHost, int zlmRtmpPort, String streamNameTemplate, SessionManager sessionManager) {
+        this.port               = port;
+        this.zlmHost            = zlmHost;
+        this.zlmRtmpPort        = zlmRtmpPort;
+        this.streamNameTemplate = streamNameTemplate;
+        this.sessionManager     = sessionManager;
     }
 
     public void start() throws InterruptedException {
@@ -59,13 +61,13 @@ public class RTMPJTStreamServer {
                                 // JT/T 1078：数据体长度字段在偏移 28 处，2 字节，不含 30 字节头
                                 // 完整帧 = 30字节头 + 数据体长度
                                 .addLast(new LengthFieldBasedFrameDecoder(65535, 28, 2, 0, 0))
-                                .addLast(new RTMPJTStreamHandler(zlmHost, zlmRtmpPort, streamName, sessionManager));
+                                .addLast(new RTMPJTStreamHandler(zlmHost, zlmRtmpPort, streamNameTemplate, sessionManager));
                     }
                 })
                 .bind(port).sync()
                 .addListener(f -> log.info(
-                        "RTMP-JT1078接收服务启动 port={} -> rtmp://{}:{}/live/{}",
-                        port, zlmHost, zlmRtmpPort, streamName));
+                        "RTMP-JT1078接收服务启动 port={} -> rtmp://{}:{}/live/{}（模板，按设备首包动态解析）",
+                        port, zlmHost, zlmRtmpPort, streamNameTemplate));
     }
 
     public void stop() {

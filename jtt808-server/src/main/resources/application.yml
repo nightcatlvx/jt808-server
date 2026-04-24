@@ -48,4 +48,6 @@ jt-server:
       zlm-host: 172.18.0.3
       zlm-rtp-port: 10000
       zlm-rtmp-port: 1935
-      stream-name: jt1078
+      # 流名模板，支持占位符 {client_id}、{channel_no}
+      # 播放地址：rtmp://<zlm-host>:<zlm-rtmp-port>/live/<client_id>/<channel_no>
+      stream-name: "{client_id}/{channel_no}"
