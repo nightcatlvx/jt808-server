@@ -214,7 +214,8 @@ public class FileService {
             return false;
         } finally {
             IOUtils.close(fos);
-            packet.release();
+            //packet.release();
+            //fix：去掉 FileService 里的 packet.release()，ByteBuf 生命周期由框架管理。
         }
     }
 

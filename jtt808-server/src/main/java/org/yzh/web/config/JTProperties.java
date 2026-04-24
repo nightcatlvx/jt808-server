@@ -8,6 +8,7 @@ import org.yzh.protocol.commons.JSATL12;
 import org.yzh.protocol.commons.JT1078;
 import org.yzh.protocol.commons.transform.attribute.Alarm;
 import org.yzh.protocol.jsatl12.T9208;
+import org.yzh.protocol.t1078.T9101;
 import org.yzh.protocol.t1078.T9206;
 
 /**
@@ -28,8 +29,34 @@ public class JTProperties {
     /** 消息类包名 */
     private String messagePackage;
     private C0801 t0801;
+    private C9101 t9101;
     private C9208 t9208;
     private C9206 t9206;
+
+    @Data
+    public static class C9101 {
+        private boolean enabled;
+        /** 本地监听端口（容器内端口） */
+        private int port;
+        /** 下发给设备的公网端口，不配置时使用 port */
+        private int publicPort;
+        /** 下发给设备的视频服务器公网 IP */
+        private String host;
+        /** ZLMediaKit 地址 */
+        private String zlmHost;
+        /** ZLMediaKit rtp_proxy 端口（旧版 RTP over TCP 用） */
+        private int zlmRtpPort;
+        /** 是否启用 RTMP 推流模式 */
+        private boolean rtmp;
+        /** ZLMediaKit RTMP 端口（默认 1935） */
+        private int zlmRtmpPort = 1935;
+        /** RTMP 流名（播放地址中的 streamId） */
+        private String streamName = "jt1078";
+
+        public int getPublicPort() {
+            return publicPort > 0 ? publicPort : 27078;
+        }
+    }
 
     @Data
     public static class C0801 {

@@ -34,7 +34,7 @@ public class JTMessagePushAdapter extends JTMessageAdapter {
     @Override
     public void encodeLog(Session session, JTMessage message, ByteBuf output) {
         int messageId = message.getMessageId();
-        String data = MessageId.getName(messageId) + JsonUtils.toJson(message) + ",hex:" + ByteBufUtil.hexDump(output, 0, output.writerIndex());
+        String data = MessageId.getName(messageId) + JsonUtils.toJson(message) + ",hex:" + formatHex(ByteBufUtil.hexDump(output, 0, output.writerIndex()));
         sseService.send(message.getClientId(), data);
         if ((!ignoreMsgs.contains(messageId)))
             log.info("{}\n>>>>>-{}", session, data);
@@ -44,7 +44,7 @@ public class JTMessagePushAdapter extends JTMessageAdapter {
     public void decodeLog(Session session, JTMessage message, ByteBuf input) {
         if (message != null) {
             int messageId = message.getMessageId();
-            String data = MessageId.getName(messageId) + JsonUtils.toJson(message) + ",hex:" + ByteBufUtil.hexDump(input, 0, input.writerIndex());
+            String data = MessageId.getName(messageId) + JsonUtils.toJson(message) + ",hex:" + formatHex(ByteBufUtil.hexDump(input, 0, input.writerIndex()));
             sseService.send(message.getClientId(), data);
             if (!ignoreMsgs.contains(messageId))
                 log.info("{}\n<<<<<-{}", session, data);

@@ -163,7 +163,8 @@ public class JT808Endpoint {
     public void T0800(T0800 message, Session session) {
     }
 
-    @Async
+    //    @Async
+    //    移除@Async 导致 ByteBuf 生命周期错位
     @Mapping(types = 多媒体数据上传, desc = "多媒体数据上传")
     public JTMessage T0801(T0801 message, Session session) {
         if (message.getPacket() == null) {

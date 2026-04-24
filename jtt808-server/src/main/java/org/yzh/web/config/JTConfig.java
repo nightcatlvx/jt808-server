@@ -14,7 +14,10 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
 import org.yzh.commons.spring.SSEService;
 import org.yzh.protocol.codec.*;
+import org.yzh.web.service.JT1078StreamServer;
+import org.yzh.web.service.RTMPJTStreamServer;
 import org.yzh.web.endpoint.JTHandlerInterceptor;
+import org.yzh.web.endpoint.MessageManager;
 import org.yzh.web.endpoint.JTMessagePushAdapter;
 import org.yzh.web.endpoint.JTMultiPacketListener;
 import org.yzh.web.model.enums.SessionKey;
@@ -90,6 +93,24 @@ public class JTConfig {
                 .setHandlerInterceptor(handlerInterceptor)
                 .setName("AlarmFile")
                 .build();
+    }
+
+    // ---- 旧版：RTP over TCP → ZLM rtp_proxy（需 openRtpServer 注册） ----
+    @ConditionalOnProperty(value = "jt-server.jt808.t9101.enabled", havingValue = "true")
+    @Bean(initMethod = "start", destroyMethod = "stop")
+    public JT1078StreamServer jt1078StreamServer(JTProperties jtProperties) {
+        JTProperties.C9101 c = jtProperties.getT9101();
+        return new JT1078StreamServer(c.getPort(), c.getZlmHost(), c.getZlmRtpPort());
+    }
+
+    // ---- 新版：RTMP → ZLM（无需注册，推流即生成） ----
+    // 启用：application.yml 设置 t9101.rtmp: true，同时将 t9101.enabled 改为 false
+    // 播放：rtmp://<host>:<zlmRtmpPort>/live/<streamName>
+    @ConditionalOnProperty(value = "jt-server.jt808.t9101.rtmp", havingValue = "true")
+    @Bean(initMethod = "start", destroyMethod = "stop")
+    public RTMPJTStreamServer rtmpJTStreamServer(JTProperties jtProperties, SessionManager sessionManager) {
+        JTProperties.C9101 c = jtProperties.getT9101();
+        return new RTMPJTStreamServer(c.getPort(), c.getZlmHost(), c.getZlmRtmpPort(), c.getStreamName(), sessionManager);
     }
 
     @Bean

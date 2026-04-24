@@ -1,5 +1,6 @@
 package org.yzh.protocol.t1078;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.github.yezhihao.protostar.annotation.Field;
 import io.github.yezhihao.protostar.annotation.Message;
 import lombok.Data;

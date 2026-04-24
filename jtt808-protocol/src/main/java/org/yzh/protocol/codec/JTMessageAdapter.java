@@ -69,11 +69,21 @@ public class JTMessageAdapter implements MessageEncoder<JTMessage>, MessageDecod
 
     public void encodeLog(Session session, JTMessage message, ByteBuf output) {
         if (log.isInfoEnabled())
-            log.info("{}\n>>>>>-{},hex[{}]", session, message, ByteBufUtil.hexDump(output));
+            log.info("{}\n>>>>>-{},hex[{}]", session, message, formatHex(ByteBufUtil.hexDump(output)));
     }
 
     public void decodeLog(Session session, JTMessage message, ByteBuf input) {
         if (log.isInfoEnabled())
-            log.info("{}\n<<<<<-{},hex[{}]", session, message, ByteBufUtil.hexDump(input, 0, input.writerIndex()));
+            log.info("{}\n<<<<<-{},hex[{}]", session, message, formatHex(ByteBufUtil.hexDump(input, 0, input.writerIndex())));
+    }
+
+    protected static String formatHex(String hex) {
+        if (hex == null || hex.length() < 2) return hex;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < hex.length(); i += 2) {
+            if (i > 0) sb.append(' ');
+            sb.append(hex, i, i + 2);
+        }
+        return sb.toString();
     }
 }

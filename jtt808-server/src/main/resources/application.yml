@@ -19,23 +19,33 @@ mybatis-plus:
     - classpath:/mapper/*.xml
 
 server:
-  port: 8100
+  port: 28101
 
 jt-server:
   jt808:
-    tcp-port: 7100
-    udp-port: 7100
+    tcp-port: 27101
+    udp-port: 27101
     idle-timeout: 180
     message-package: org.yzh.protocol
     t0801:
-      path: D:/jt_data/media_file
+      path: /jt_data/media_file
     t9208:
-      host: 127.0.0.1
-      port: 7200
-      enabled: true
-      path: D:/jt_data/alarm_file
+      host: 0.0.0.0
+      port: 27201
+      enabled: false
+      path: /jt_data/alarm_file
     t9206:
       host: 127.0.0.1
       port: 21
       username: test
       password: test
+    t9101:
+      enabled: false
+      rtmp: true
+      port: 7078
+      public-port: 27078
+      host: 0.0.0.0
+      zlm-host: 172.18.0.3
+      zlm-rtp-port: 10000
+      zlm-rtmp-port: 1935
+      stream-name: jt1078
