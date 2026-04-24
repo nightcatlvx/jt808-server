@@ -43,3 +43,5 @@ README.html
 src/main/resources/swagger.yaml
 *local.yml
 *local.yaml
+
+.claude/
