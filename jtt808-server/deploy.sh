@@ -37,10 +37,12 @@ echo "启动容器..."
 docker run -d \
   --name ${CONTAINER_NAME} \
   --restart=always \
-  -p 8100:8100 \
-  -p 7100:7100 \
-  -p 7100:7100/udp \
-  -p 7200:7200 \
+  -p 28101:28101 \
+  -p 27101:27101 \
+  -p 27101:27101/udp \
+  -p 27201:27201 \
+  -p 27002:27002 \
+  -p 27078:7078 \
   -v ${DEPLOY_DIR}/jt_data/media_file:/jt_data/media_file \
   -v ${DEPLOY_DIR}/jt_data/alarm_file:/jt_data/alarm_file \
   -v ${DEPLOY_DIR}/logs:/app/logs \
