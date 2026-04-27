@@ -49,10 +49,6 @@ jt-server:
       zlm-rtp-port: 10000
       zlm-rtmp-port: 1935
       # 流名模板，支持占位符 {client_id}、{channel_no}
-      # 注意：流名中不能含 "/"，否则 HTTP-FLV (/live/<stream>.flv) URL 路由会被截断 → 404
-      # 推荐用 "_" 分隔。HLS 仍可播是因为它生成嵌套目录，但 FLV/WS-FLV 必须单段
       # 播放地址：rtmp://<zlm-host>:<zlm-rtmp-port>/live/<client_id>_<channel_no>
+      # 注意：用下划线而非斜杠，与 live-player.html 的 STREAM 构造保持一致
       stream-name: "{client_id}_{channel_no}"
-      # 是否推送音频。设为 false 时所有音频包静默丢弃，仅推视频
-      # 已支持编码：G.711A(PT=6) / G.711U(PT=7) / AAC(PT=19，自动解析 ADTS 构造 ASC)
-      audio-enabled: true

@@ -65,7 +65,7 @@ public class RTMPJTStreamServer {
                                 // JT/T 1078 三种包头长度不同（视频30/音频26/透传24），
                                 // 长度字段位置也不同。必须用自定义 decoder 区分 dataType。
                                 .addLast(new JT1078FrameDecoder())
-                                .addLast(new RTMPJTStreamHandler(zlmHost, zlmRtmpPort, streamNameTemplate, audioEnabled, sessionManager));
+                                .addLast(new RTMPJTStreamHandler(zlmHost, zlmRtmpPort, streamNameTemplate, sessionManager));
                     }
                 })
                 .bind(port).sync()
