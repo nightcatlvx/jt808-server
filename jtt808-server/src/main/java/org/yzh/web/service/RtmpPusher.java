@@ -342,21 +342,40 @@ public class RtmpPusher {
         if (relativeTs > 0xFFFFFFL) relativeTs = 0xFFFFFFL;
 
         switch (jtPt) {
-            case 6:  pushG711(data, (int) relativeTs, 0x72); return; // G.711A
-            case 7:  pushG711(data, (int) relativeTs, 0x82); return; // G.711U
+            case 6:  pushG711(data, (int) relativeTs, 0x70); return; // G.711A
+            case 7:  pushG711(data, (int) relativeTs, 0x80); return; // G.711U
             case 19: pushAac  (data, (int) relativeTs);       return; // AAC(ADTS)
             default:
                 log.warn("不支持的音频编码 PT={}，跳过（当前支持 G.711A/G.711U/AAC）", jtPt);
         }
     }
 
+    /**
+     * G.711 推流：数据按帧长切分，每帧独立时间戳。
+     * G.711A/G.711U @8kHz 标准帧长 160B=20ms，也兼容 320B=40ms。
+     * 设备可能一个 JT1078 包里塞多帧，若全打同一时间戳 → 播放器瞬间播完 → 脉冲。
+     */
     private void pushG711(byte[] data, int ts, int flvHeader) throws Exception {
-        byte[] body = new byte[1 + data.length];
-        body[0] = (byte) flvHeader;
-        System.arraycopy(data, 0, body, 1, data.length);
-        sendChunk(6, ts, MSG_AUDIO, msgStreamId, body);
-        out.flush();
-        log.info("RTMP音频帧 ts={}ms g711 size={}B", ts, data.length);
+        // 帧长：优先 160B(20ms)，若 data 正好是 320B 的倍数则用 320B
+        int frameLen = 160;
+        int frameMs  = 20;
+        if (data.length >= 320 && data.length % 320 == 0) {
+            frameLen = 320;
+            frameMs  = 40;
+        }
+        int offset = 0;
+        int frameTs = ts;
+        while (offset < data.length) {
+            int len = Math.min(frameLen, data.length - offset);
+            byte[] body = new byte[1 + len];
+            body[0] = (byte) flvHeader;
+            System.arraycopy(data, offset, body, 1, len);
+            sendChunk(6, frameTs, MSG_AUDIO, msgStreamId, body);
+            log.info("RTMP音频帧 ts={}ms g711 size={}B", frameTs, len);
+            offset += len;
+            frameTs += frameMs;
+        }
+        out.flush(); // 一次 flush，减少 syscall
     }
 
     /**
