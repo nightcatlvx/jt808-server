@@ -110,7 +110,7 @@ public class JTConfig {
     @Bean(initMethod = "start", destroyMethod = "stop")
     public RTMPJTStreamServer rtmpJTStreamServer(JTProperties jtProperties, SessionManager sessionManager) {
         JTProperties.C9101 c = jtProperties.getT9101();
-        return new RTMPJTStreamServer(c.getPort(), c.getZlmHost(), c.getZlmRtmpPort(), c.getStreamName(), sessionManager);
+        return new RTMPJTStreamServer(c.getPort(), c.getZlmHost(), c.getZlmRtmpPort(), c.getStreamName(), c.isAudioEnabled(), sessionManager);
     }
 
     @Bean
