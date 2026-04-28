@@ -252,12 +252,20 @@ public class RtmpPusher {
 
         List<byte[]> nals = parseAnnexB(annexBFrame);
         if (nals.isEmpty()) {
-            // 正常情况下不会走到这里：设备应发标准 Annex-B，首包(flag=1)带 00 00 00 01
-            // 走到这里 = 帧被截断（中间片段丢了首段）或设备发了非 Annex-B 格式
-            // 此时硬推出去只会让解码器崩花屏，直接丢弃 + hex 打印便于排查
-            String head = bytesToHex(annexBFrame, 0, Math.min(16, annexBFrame.length));
-            log.warn("Annex-B无起始码，丢弃帧 size={}B 前16B={}", annexBFrame.length, head);
-            return;
+            // 设备可能使用非标准封装（如 PT=98 厂商自定义格式、加密等），
+            // 数据不含 Annex-B 起始码（00 00 00 01 / 00 00 01），parseAnnexB 无法切分。
+            //
+            // 策略：如果 AVC sequence header 已发送，将整帧当作一个 NAL 推出去，
+            // 由解码器尝试容错（多数解码器对首位为 0xFD/0xBA 等非标准 NAL 会跳过）；
+            // 如果 header 还没发，说明连 SPS/PPS 都没有，帧无能为力，只能丢弃。
+            if (!headerSent) {
+                String head = bytesToHex(annexBFrame, 0, Math.min(16, annexBFrame.length));
+                log.warn("Annex-B无起始码且header未发送，丢弃帧 size={}B 前16B={}", annexBFrame.length, head);
+                return;
+            }
+            log.info("非Annex-B数据，按单NAL推送 size={}B 前4B={}",
+                    annexBFrame.length, bytesToHex(annexBFrame, 0, Math.min(4, annexBFrame.length)));
+            nals = java.util.Collections.singletonList(annexBFrame);
         }
 
         // 视频独立时间戳基准
