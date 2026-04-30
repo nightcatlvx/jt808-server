@@ -13,6 +13,7 @@ import org.yzh.protocol.t1078.*;
 import org.yzh.protocol.t808.T0001;
 import org.yzh.web.config.JTProperties;
 import org.yzh.web.endpoint.MessageManager;
+import org.yzh.web.service.RTMPJTStreamHandler;
 import reactor.core.publisher.Mono;
 
 @RestController
@@ -45,6 +46,9 @@ public class JT1078Controller {
     @Operation(summary = "9201 平台下发远程录像回放请求")
     @PostMapping("9201")
     public Mono<T1205> T9201(@RequestBody T9201 request) {
+        // 标记回放：设备连上 27078 后，RTMPJTStreamHandler 读到该标记会追加 _playback 后缀，
+        // 避免与实时流 (9101) 同名冲突导致 ZLM 拒绝第二个发布者。
+        RTMPJTStreamHandler.markPlayback(request.getClientId(), request.getChannelNo());
         return messageManager.request(request, T1205.class);
     }
 

@@ -22,6 +22,9 @@ public class RtmpPusher {
     private DataInputStream in;
     private OutputStream out;
 
+    /** 连接是否已确认断开（任何 IO 写入失败立即置 true，避免后续调用持续抛异常刷屏） */
+    private volatile boolean broken;
+
     /** 我们向服务器发送的 chunk 大小（需通过 Set Chunk Size 消息告知服务器） */
     private static final int TX_CHUNK_SIZE = 4096;
     /** 服务器默认 chunk 大小，收到 Set Chunk Size 后更新 */
@@ -263,7 +266,7 @@ public class RtmpPusher {
                 log.warn("Annex-B无起始码且header未发送，丢弃帧 size={}B 前16B={}", annexBFrame.length, head);
                 return;
             }
-            log.info("非Annex-B数据，按单NAL推送 size={}B 前4B={}",
+            log.debug("非Annex-B数据，按单NAL推送 size={}B 前4B={}",
                     annexBFrame.length, bytesToHex(annexBFrame, 0, Math.min(4, annexBFrame.length)));
             nals = java.util.Collections.singletonList(annexBFrame);
         }
@@ -323,8 +326,8 @@ public class RtmpPusher {
         video.write(avcc.toByteArray());
 
         sendChunk(4, (int) relativeTs, MSG_VIDEO, msgStreamId, video.toByteArray());
-        out.flush();
-        log.info("RTMP视频帧 ts={}ms(raw={}) keyframe={} avcc={}B 源前16B={}",
+        safeFlush();
+        log.debug("RTMP视频帧 ts={}ms(raw={}) keyframe={} avcc={}B 源前16B={}",
                 relativeTs, timestampMs, keyframe, avcc.size(),
                 bytesToHex(annexBFrame, 0, Math.min(16, annexBFrame.length)));
     }
@@ -379,11 +382,11 @@ public class RtmpPusher {
             body[0] = (byte) flvHeader;
             System.arraycopy(data, offset, body, 1, len);
             sendChunk(6, frameTs, MSG_AUDIO, msgStreamId, body);
-            log.info("RTMP音频帧 ts={}ms g711 size={}B", frameTs, len);
+            log.debug("RTMP音频帧 ts={}ms g711 size={}B", frameTs, len);
             offset += len;
             frameTs += frameMs;
         }
-        out.flush(); // 一次 flush，减少 syscall
+        safeFlush(); // 一次 flush，减少 syscall
     }
 
     /**
@@ -442,8 +445,8 @@ public class RtmpPusher {
         body[1] = 0x01;        // AACPacketType: 1 = raw AAC frame
         System.arraycopy(rawAac, 0, body, 2, rawAac.length);
         sendChunk(6, ts, MSG_AUDIO, msgStreamId, body);
-        out.flush();
-        log.info("RTMP音频帧 ts={}ms aac-raw size={}B", ts, rawAac.length);
+        safeFlush();
+        log.debug("RTMP音频帧 ts={}ms aac-raw size={}B", ts, rawAac.length);
     }
 
     /**
@@ -476,7 +479,7 @@ public class RtmpPusher {
         body[1] = 0x00;        // AACPacketType: 0 = sequence header
         System.arraycopy(aacAsc, 0, body, 2, aacAsc.length);
         sendChunk(6, timestamp, MSG_AUDIO, msgStreamId, body);
-        out.flush();
+        safeFlush();
         log.info("AAC sequence header发送完成 asc={}B ts={}", aacAsc.length, timestamp);
     }
 
@@ -502,7 +505,7 @@ public class RtmpPusher {
         video.write(cfg.toByteArray());
 
         sendChunk(4, timestamp, MSG_VIDEO, msgStreamId, video.toByteArray());
-        out.flush();
+        safeFlush();
         log.info("AVC sequence header发送完成 sps={}B pps={}B ts={}", sps.length, pps.length, timestamp);
     }
 
@@ -510,33 +513,38 @@ public class RtmpPusher {
     // RTMP Chunk 发送
     // ======================================================
 
-    private void sendChunk(int csid, int timestamp, int msgType, int msgStreamId, byte[] data) throws Exception {
+    private void sendChunk(int csid, int timestamp, int msgType, int msgStreamId, byte[] data) throws IOException {
         int total  = data.length;
         int offset = 0;
         boolean first = true;
-        while (offset < total) {
-            int chunkLen = Math.min(TX_CHUNK_SIZE, total - offset);
-            if (first) {
-                // fmt=0: 完整消息头（11字节）
-                out.write(csid & 0x3F);                 // basic header: fmt=0
-                out.write((timestamp >> 16) & 0xFF);    // timestamp (3B)
-                out.write((timestamp >>  8) & 0xFF);
-                out.write( timestamp        & 0xFF);
-                out.write((total >> 16) & 0xFF);        // message length (3B)
-                out.write((total >>  8) & 0xFF);
-                out.write( total        & 0xFF);
-                out.write(msgType & 0xFF);              // message type (1B)
-                out.write( msgStreamId        & 0xFF);  // stream id (4B, little-endian)
-                out.write((msgStreamId >>  8) & 0xFF);
-                out.write((msgStreamId >> 16) & 0xFF);
-                out.write((msgStreamId >> 24) & 0xFF);
-                first = false;
-            } else {
-                // fmt=3: 无头，续包
-                out.write(0xC0 | (csid & 0x3F));
+        try {
+            while (offset < total) {
+                int chunkLen = Math.min(TX_CHUNK_SIZE, total - offset);
+                if (first) {
+                    // fmt=0: 完整消息头（11字节）
+                    out.write(csid & 0x3F);                 // basic header: fmt=0
+                    out.write((timestamp >> 16) & 0xFF);    // timestamp (3B)
+                    out.write((timestamp >>  8) & 0xFF);
+                    out.write( timestamp        & 0xFF);
+                    out.write((total >> 16) & 0xFF);        // message length (3B)
+                    out.write((total >>  8) & 0xFF);
+                    out.write( total        & 0xFF);
+                    out.write(msgType & 0xFF);              // message type (1B)
+                    out.write( msgStreamId        & 0xFF);  // stream id (4B, little-endian)
+                    out.write((msgStreamId >>  8) & 0xFF);
+                    out.write((msgStreamId >> 16) & 0xFF);
+                    out.write((msgStreamId >> 24) & 0xFF);
+                    first = false;
+                } else {
+                    // fmt=3: 无头，续包
+                    out.write(0xC0 | (csid & 0x3F));
+                }
+                out.write(data, offset, chunkLen);
+                offset += chunkLen;
             }
-            out.write(data, offset, chunkLen);
-            offset += chunkLen;
+        } catch (IOException e) {
+            broken = true;
+            throw e;
         }
     }
 
@@ -689,6 +697,16 @@ public class RtmpPusher {
         return 0;
     }
 
+    /** flush 输出流，若失败则标记 broken 并外抛 */
+    private void safeFlush() throws IOException {
+        try {
+            out.flush();
+        } catch (IOException e) {
+            broken = true;
+            throw e;
+        }
+    }
+
     // ======================================================
     // IO 工具
     // ======================================================
@@ -737,7 +755,13 @@ public class RtmpPusher {
     // 关闭
     // ======================================================
 
+    /** 连接是否已断（供调用方在推流前快速判断，避免每帧都触发异常） */
+    public boolean isBroken() {
+        return broken;
+    }
+
     public synchronized void close() {
+        broken = true;
         try { if (out    != null) out.close();    } catch (Exception ignored) {}
         try { if (socket != null) socket.close(); } catch (Exception ignored) {}
         out    = null;
