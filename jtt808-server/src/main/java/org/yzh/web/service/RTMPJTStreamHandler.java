@@ -10,8 +10,10 @@ import org.yzh.protocol.commons.JT1078;
 import org.yzh.protocol.t1078.T9105;
 
 import java.io.ByteArrayOutputStream;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * JT/T 1078 视频帧接收处理器（RTMP 推流版）
@@ -40,6 +42,11 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final ByteArrayOutputStream videoBuffer = new ByteArrayOutputStream(65536);
     private long videoTimestamp = 0;
 
+    // SPS/PPS 备份：当超大 I 帧触发缓冲上限被丢弃时，先扫描并保存 SPS/PPS，
+    // 后续 flushVideoFrame 时若帧缺少 Annex-B 起始码，自动补回，避免解码器永久黑屏
+    private byte[] savedSps;
+    private byte[] savedPps;
+
     // 音频缓冲：独立于视频，多数设备音频一包一帧（flag=0），也按分包逻辑兜底
     // 兼容模式：设备不发音频也完全 OK；发了支持编码就推，不支持的编码静默忽略（只记一次 WARN）
     private final ByteArrayOutputStream audioBuffer = new ByteArrayOutputStream(4096);
@@ -53,8 +60,48 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private int    channelNo;  // 逻辑通道号
 
     // T9105 定时任务：按标准每1秒发送一条，而不是每个子包都发
+    // 仅当有数据持续到达时才发送；超过 30s 无数据视为流已断开，停发 T9105 并关闭连接
     private ScheduledFuture<?> t9105Task;
-    private static final long T9105_INTERVAL_MS = 1000;
+    private ChannelHandlerContext handlerCtx; // 存储 ctx 引用，供 T9105 空闲超时关闭连接用
+    private static final long T9105_INTERVAL_MS = 10_000;
+    private static final long T9105_IDLE_TIMEOUT_MS = 30_000;
+    private long lastDataTime;             // 最近一次收到数据的时间戳（用于 T9105 空闲检测）
+
+    // RTMP 推流错误限流：RTMP 断开后设备 TCP 可能仍存活，每帧都会触发一次推流失败。
+    // 为避免日志刷屏，同一类错误在限流窗口内只记一次 ERROR，其余降为 DEBUG。
+    private static final long ERROR_THROTTLE_MS = 10_000;
+    private String lastErrorKey;           // 上次 ERROR 日志的特征 key（类别+消息）
+    private long   lastErrorTime;          // 上次 ERROR 日志的时间戳
+
+    // 共享 RtmpPusher 池：设备会为同一通道开两条 JT1078 TCP 连接（一条传视频 PT=98，一条传音频 PT=6），
+    // 但 ZLM 同一流名只能有一个发布者，第二条 publish 会被拒绝。
+    // 此处按 streamName 复用同一个 RtmpPusher，引用计数归零才真正关闭。
+    private static final ConcurrentHashMap<String, SharedPusher> pusherPool = new ConcurrentHashMap<>();
+
+    // 回放标记：9201 与 9101 共用端口 27078，但 ZLM 不允许同一流名有两个发布者。
+    // 9201 下发前通过 markPlayback() 标记 (clientId, channelNo)，
+    // initRtmpPusher() 中通过 isPlaybackAndClear() 原子地消费该标记，
+    // 若为回放则流名追加 _playback 后缀，与实时流区分。
+    private static final ConcurrentHashMap<String, Boolean> PLAYBACK_MARKS = new ConcurrentHashMap<>();
+
+    /** 标记某个设备+通道最近一次 27078 连接是回放（由 9201 REST 端点调用） */
+    public static void markPlayback(String clientId, int channelNo) {
+        String key = clientId + "_" + channelNo;
+        PLAYBACK_MARKS.put(key, Boolean.TRUE);
+        log.info("已标记回放流 key={}", key);
+    }
+
+    /** 检查并原子消费回放标记，返回 true 表示本次连接是回放 */
+    private static boolean isPlaybackAndClear(String clientId, int channelNo) {
+        String key = clientId + "_" + channelNo;
+        return PLAYBACK_MARKS.remove(key) != null;
+    }
+
+    private static class SharedPusher {
+        final RtmpPusher pusher;
+        final AtomicInteger refCount = new AtomicInteger(1);
+        SharedPusher(RtmpPusher pusher) { this.pusher = pusher; }
+    }
 
     public RTMPJTStreamHandler(String zlmHost, int zlmRtmpPort, String streamNameTemplate, SessionManager sessionManager) {
         this.zlmHost            = zlmHost;
@@ -69,14 +116,18 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     @Override
     public void channelActive(ChannelHandlerContext ctx) {
+        handlerCtx = ctx;
         log.info("JT1078设备连接 remote={}，等待首包以确定流名（模板={}）",
                 ctx.channel().remoteAddress(), streamNameTemplate);
+        lastDataTime = System.currentTimeMillis();
         // RTMP 连接延迟到 channelRead0 中首包解析出 clientId/channelNo 后再建立
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
         log.info("JT1078设备断开 remote={}", ctx.channel().remoteAddress());
+
+        handlerCtx = null;
 
         // 停止 T9105 定时器
         if (t9105Task != null) {
@@ -96,13 +147,8 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
         videoBuffer.reset();
         audioBuffer.reset();
 
-        // 延迟 5 秒关闭 RTMP，给 ZLM 时间完成流索引，播放器可正常拉流
-        ctx.channel().eventLoop().schedule(() -> {
-            if (rtmpPusher != null) {
-                rtmpPusher.close();
-                rtmpPusher = null;
-            }
-        }, 5, TimeUnit.SECONDS);
+        // 释放共享 Pusher 引用：计数归零立即关闭，不再等（设备会快速重连，等待反而导致旧流占坑）
+        releasePusher();
     }
 
     @Override
@@ -126,7 +172,7 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         // ---- 解析 JT/T 1078 表19 固定头部（30字节）----
         msg.skipBytes(4);                // [0-3]  帧标识 0x30 0x31 0x63 0x64
-        msg.skipBytes(1);                // [4]    V/P/X/CC
+        byte vpxcc   = msg.readByte();   // [4]    V/P/X/CC - V:version P:priority X:encrypt CC:reserved
         byte mpt     = msg.readByte();   // [5]    M(1) + PT(7) 编码类型
         int  pt      = mpt & 0x7F;
         msg.skipBytes(2);                // [6-7]  JT1078 包序号
@@ -150,11 +196,24 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
             return;
         }
 
+        // 有数据到达 → 刷新 T9105 空闲计时器
+        lastDataTime = System.currentTimeMillis();
+
+        // RTMP 连接已断开 → 该 JT1078 连接已失去意义，直接关闭避免每帧触发推流异常
+        if (rtmpPusher != null && rtmpPusher.isBroken()) {
+            log.debug("RTMP已断，关闭JT1078连接 clientId={}", clientId);
+            ctx.close();
+            return;
+        }
+
         // 首次收包：提取 clientId 和通道号，解析流名模板并建立 RTMP 连接，启动 T9105 定时器
         if (clientId == null) {
             clientId  = parseSim(simBytes);
             channelNo = channel & 0xFF;
-            log.info("JT1078首包 clientId={} channelNo={} pt={}", clientId, channelNo, pt);
+            log.info("JT1078首包 clientId={} channelNo={} pt={} vpxcc=0x{} (V={} P={} X={} CC={})",
+                    clientId, channelNo, pt,
+                    String.format("%02X", vpxcc),
+                    (vpxcc >> 7) & 1, (vpxcc >> 6) & 1, (vpxcc >> 5) & 1, vpxcc & 0x1F);
             initRtmpPusher();
             startT9105Timer(ctx);
         }
@@ -180,11 +239,12 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
         videoBuffer.write(payload, 0, payload.length);
 
-        log.info("视频子包 dataType={} flag={} payloadLen={}B 累计={}B ts={}ms",
+        log.debug("视频子包 dataType={} flag={} payloadLen={}B 累计={}B ts={}ms",
                 dataType, flag, payload.length, videoBuffer.size(), videoTimestamp);
 
-        if (videoBuffer.size() > 200 * 1024) {
-            log.warn("视频缓冲异常过大 size={}B，强制丢弃避免内存爆炸", videoBuffer.size());
+        if (videoBuffer.size() > 1024 * 1024) {
+            log.warn("视频缓冲异常过大 size={}B，备份SPS/PPS后丢弃", videoBuffer.size());
+            backupSpsPps();
             videoBuffer.reset();
             return;
         }
@@ -203,7 +263,7 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (!audioCodecChecked) {
             audioCodecChecked = true;
             audioPt      = pt;
-            audioEnabled = (pt == 6 || pt == 7); // 仅 G.711A / G.711U
+            audioEnabled = (pt == 6 || pt == 7 || pt == 19); // G.711A / G.711U / AAC
             if (audioEnabled) {
                 log.info("音频启用 PT={} ({})", pt, codecName(pt));
             } else {
@@ -217,7 +277,7 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
         audioBuffer.write(payload, 0, payload.length);
 
-        log.info("音频子包 flag={} pt={} payloadLen={}B 累计={}B ts={}ms",
+        log.debug("音频子包 flag={} pt={} payloadLen={}B 累计={}B ts={}ms",
                 flag, pt, payload.length, audioBuffer.size(), audioTimestamp);
 
         if (audioBuffer.size() > 64 * 1024) {
@@ -237,7 +297,7 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
             case 7:  return "G.711U";
             case 8:  return "G.726";
             case 9:  return "G.729A";
-            case 19: return "AAC";
+            case 19: return "AAC(ADTS)";
             case 25: return "ADPCM";
             case 26: return "MP3";
             default: return "未知/不支持";
@@ -263,7 +323,32 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void sendT9105() {
-        log.info("T9105定时触发 clientId={} channelNo={}", clientId, channelNo);
+        long idle = System.currentTimeMillis() - lastDataTime;
+        if (idle > T9105_IDLE_TIMEOUT_MS) {
+            log.warn("T9105空闲超时 clientId={} channelNo={} idle={}ms，关闭JT1078连接",
+                    clientId, channelNo, idle);
+            if (t9105Task != null) {
+                t9105Task.cancel(false);
+                t9105Task = null;
+            }
+            if (handlerCtx != null) {
+                handlerCtx.close();
+            }
+            return;
+        }
+        // RTMP 已断时无需继续维持心跳，直接关闭（设备无流可推，重连才有意义）
+        if (rtmpPusher != null && rtmpPusher.isBroken()) {
+            log.warn("T9105: RTMP连接已断，停止心跳并关闭JT1078连接 clientId={}", clientId);
+            if (t9105Task != null) {
+                t9105Task.cancel(false);
+                t9105Task = null;
+            }
+            if (handlerCtx != null) {
+                handlerCtx.close();
+            }
+            return;
+        }
+        log.debug("T9105定时触发 clientId={} channelNo={}", clientId, channelNo);
         if (clientId == null || sessionManager == null) return;
         Session session = sessionManager.get(clientId);
         if (session == null || !session.isRegistered()) {
@@ -276,7 +361,7 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
         t9105.setPacketLossRate(0);
         try {
             session.notify(t9105).block();
-            log.info("T9105已发送 clientId={} channelNo={}", clientId, channelNo);
+            log.debug("T9105已发送 clientId={} channelNo={}", clientId, channelNo);
         } catch (Exception e) {
             log.warn("T9105发送失败 clientId={} err={}", clientId, e.getMessage());
         }
@@ -291,36 +376,92 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
      * 支持占位符：{client_id}、{channel_no}
      */
     private void initRtmpPusher() {
+        boolean isPlayback = isPlaybackAndClear(clientId, channelNo);
         resolvedStreamName = streamNameTemplate
                 .replace("{client_id}",  clientId)
                 .replace("{channel_no}", String.valueOf(channelNo));
-        log.info("解析流名 模板={} → 实际={}", streamNameTemplate, resolvedStreamName);
-
-        rtmpPusher = new RtmpPusher(zlmHost, zlmRtmpPort, "live", resolvedStreamName);
-        try {
-            rtmpPusher.connect();
-        } catch (Exception e) {
-            log.error("RTMP连接失败，本次音视频将丢弃 stream={}: {}", resolvedStreamName, e.getMessage());
-            rtmpPusher = null;
+        if (isPlayback) {
+            resolvedStreamName = resolvedStreamName + "_playback";
+            log.info("回放模式，流名追加 _playback 后缀 clientId={} channelNo={} → {}", clientId, channelNo, resolvedStreamName);
+        } else {
+            log.info("解析流名 模板={} → 实际={}", streamNameTemplate, resolvedStreamName);
         }
+
+        // 共享池：同一流名的第二条 JT1078 连接（如音频通道）复用已有 RTMP 连接，避免 ZLM 拒绝重复 publish
+        SharedPusher sp = pusherPool.compute(resolvedStreamName, (k, existing) -> {
+            if (existing != null) {
+                existing.refCount.incrementAndGet();
+                log.info("复用已有RTMP连接 stream={} refCount={}", k, existing.refCount.get());
+                return existing;
+            }
+            RtmpPusher p = new RtmpPusher(zlmHost, zlmRtmpPort, "live", resolvedStreamName);
+            try {
+                p.connect();
+                log.info("新建RTMP连接 stream={}", k);
+            } catch (Exception e) {
+                log.error("RTMP连接失败 stream={}: {}", k, e.getMessage());
+                return null;
+            }
+            return new SharedPusher(p);
+        });
+        rtmpPusher = sp != null ? sp.pusher : null;
+    }
+
+    /** 释放本连接对共享 Pusher 的引用，计数归零则立即关闭 RTMP */
+    private void releasePusher() {
+        if (resolvedStreamName == null) return;
+        pusherPool.computeIfPresent(resolvedStreamName, (k, sp) -> {
+            int n = sp.refCount.decrementAndGet();
+            log.info("RTMP引用释放 stream={} refCount={}", k, n);
+            if (n == 0) {
+                sp.pusher.close();
+                log.info("RTMP共享连接已关闭 stream={}", k);
+                return null;
+            }
+            return sp;
+        });
+        rtmpPusher = null;
     }
 
     private void flushVideoFrame() {
-        byte[] annexBFrame = videoBuffer.toByteArray();
+        byte[] frame = videoBuffer.toByteArray();
         videoBuffer.reset();
 
-        if (annexBFrame.length == 0) return;
+        if (frame.length == 0) return;
 
         if (rtmpPusher == null) {
-            log.warn("RTMP未连接，丢弃视频帧 size={}B", annexBFrame.length);
+            log.warn("RTMP未连接，丢弃视频帧 size={}B", frame.length);
             return;
         }
 
-        log.info("视频组帧完成 size={}B ts={}ms，RTMP推流中...", annexBFrame.length, videoTimestamp);
+        // 如果之前因缓冲溢出备份了 SPS/PPS，且当前帧缺少 Annex-B 起始码，
+        // 则将 SPS/PPS 以 Annex-B 格式补回帧头，让 RtmpPusher 能正确发送 AVC sequence header
+        if (savedSps != null && savedPps != null && !hasAnnexBStartCode(frame)) {
+            log.info("补回SPS/PPS到帧头 spsLen={} ppsLen={} frameLen={}", savedSps.length, savedPps.length, frame.length);
+            ByteArrayOutputStream fixed = new ByteArrayOutputStream(frame.length + savedSps.length + savedPps.length + 8);
+            try {
+                fixed.write(new byte[]{0, 0, 0, 1});
+                fixed.write(savedSps);
+                fixed.write(new byte[]{0, 0, 0, 1});
+                fixed.write(savedPps);
+                fixed.write(frame);
+            } catch (Exception ignored) { }
+            frame = fixed.toByteArray();
+            // 用完即清，避免后续帧重复补回
+            savedSps = null;
+            savedPps = null;
+        }
+
+        log.debug("视频组帧完成 size={}B ts={}ms，RTMP推流中...", frame.length, videoTimestamp);
         try {
-            rtmpPusher.pushVideo(annexBFrame, videoTimestamp);
+            rtmpPusher.pushVideo(frame, videoTimestamp);
         } catch (Exception e) {
-            log.error("RTMP视频推流失败: {}", e.getMessage(), e);
+            logRtmpError("视频", e);
+            // RTMP 连接已确认断开 → 关闭 JT1078 通道，阻止后续帧继续触发异常刷屏
+            if (rtmpPusher.isBroken() && handlerCtx != null) {
+                log.warn("RTMP连接已断，主动关闭JT1078连接 clientId={}", clientId);
+                handlerCtx.close();
+            }
         }
     }
 
@@ -335,17 +476,92 @@ public class RTMPJTStreamHandler extends SimpleChannelInboundHandler<ByteBuf> {
             return;
         }
 
-        log.info("音频组帧完成 size={}B pt={} ts={}ms，RTMP推流中...", audioFrame.length, audioPt, audioTimestamp);
+        log.debug("音频组帧完成 size={}B pt={} ts={}ms，RTMP推流中...", audioFrame.length, audioPt, audioTimestamp);
         try {
             rtmpPusher.pushAudio(audioFrame, audioPt, audioTimestamp);
         } catch (Exception e) {
-            log.error("RTMP音频推流失败: {}", e.getMessage(), e);
+            logRtmpError("音频", e);
+            // RTMP 连接已确认断开 → 关闭 JT1078 通道
+            if (rtmpPusher.isBroken() && handlerCtx != null) {
+                log.warn("RTMP连接已断，主动关闭JT1078连接 clientId={}", clientId);
+                handlerCtx.close();
+            }
         }
     }
 
     // ======================================================
     // 工具
     // ======================================================
+
+    /**
+     * 扫描 videoBuffer 中的 Annex-B 起始码，提取 SPS (NAL type=7) 和 PPS (NAL type=8) 并保存。
+     * 仅在缓冲溢出时调用，防止因丢弃过大的 I 帧而永久丢失编解码参数。
+     */
+    private void backupSpsPps() {
+        byte[] data = videoBuffer.toByteArray();
+        int len = data.length;
+        int i = 0;
+        while (i < len - 4) {
+            // 匹配 Annex-B 起始码: 00 00 00 01 或 00 00 01
+            int nalStart;
+            if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+                nalStart = i + 4;
+                i += 4;
+            } else if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+                nalStart = i + 3;
+                i += 3;
+            } else {
+                i++;
+                continue;
+            }
+            if (nalStart >= len) break;
+            int nalType = data[nalStart] & 0x1F;
+            // 找到下一个起始码的位置作为 NAL 结束
+            int end = len;
+            for (int j = i; j < len - 3; j++) {
+                if ((data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 0 && data[j + 3] == 1)
+                        || (data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1)) {
+                    end = j;
+                    break;
+                }
+            }
+            int nalLen = end - nalStart;
+            if (nalType == 7 && savedSps == null) {
+                savedSps = new byte[nalLen];
+                System.arraycopy(data, nalStart, savedSps, 0, nalLen);
+                log.info("溢出前备份SPS len={}", nalLen);
+            } else if (nalType == 8 && savedPps == null) {
+                savedPps = new byte[nalLen];
+                System.arraycopy(data, nalStart, savedPps, 0, nalLen);
+                log.info("溢出前备份PPS len={}", nalLen);
+            }
+            i = end;
+        }
+    }
+
+    /**
+     * RTMP 推流错误限流日志。
+     * 同一错误在 ERROR_THROTTLE_MS 窗口内只打一次 ERROR（含堆栈），
+     * 之后的降级为 DEBUG（仅消息），避免刷屏。
+     */
+    private void logRtmpError(String cat, Exception e) {
+        String key = cat + ":" + e.getClass().getSimpleName() + ":" + e.getMessage();
+        long now = System.currentTimeMillis();
+        if (key.equals(lastErrorKey) && (now - lastErrorTime) < ERROR_THROTTLE_MS) {
+            log.debug("RTMP{}推流失败(限流): {}", cat, e.getMessage());
+            return;
+        }
+        lastErrorKey  = key;
+        lastErrorTime = now;
+        log.error("RTMP{}推流失败: {}", cat, e.getMessage(), e);
+    }
+
+    /** 检查数据是否以 Annex-B 起始码（00 00 00 01 或 00 00 01）开头 */
+    private static boolean hasAnnexBStartCode(byte[] data) {
+        if (data.length < 4) return false;
+        return (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1)
+                || (data[0] == 0 && data[1] == 0 && data[2] == 1);
+    }
 
     /**
      * BCD 6字节 → 12位数字字符串（JT808 clientId 格式）

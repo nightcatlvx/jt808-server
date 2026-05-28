@@ -49,5 +49,6 @@ jt-server:
       zlm-rtp-port: 10000
       zlm-rtmp-port: 1935
       # 流名模板，支持占位符 {client_id}、{channel_no}
-      # 播放地址：rtmp://<zlm-host>:<zlm-rtmp-port>/live/<client_id>/<channel_no>
-      stream-name: "{client_id}/{channel_no}"
+      # 播放地址：rtmp://<zlm-host>:<zlm-rtmp-port>/live/<client_id>_<channel_no>
+      # 注意：用下划线而非斜杠，与 live-player.html 的 STREAM 构造保持一致
+      stream-name: "{client_id}_{channel_no}"

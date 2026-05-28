@@ -36,6 +36,7 @@ public class MessageManager {
     }
 
     public <T> Mono<T> request(String sessionId, JTMessage request, Class<T> responseClass) {
+        if (sessionId == null) return Mono.error(new APIException(4003, "clientId 为空，请检查请求参数"));
         Session session = sessionManager.get(sessionId);
         if (session == null) return OFFLINE;
 

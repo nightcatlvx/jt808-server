@@ -22,6 +22,9 @@ public class RtmpPusher {
     private DataInputStream in;
     private OutputStream out;
 
+    /** 连接是否已确认断开（任何 IO 写入失败立即置 true，避免后续调用持续抛异常刷屏） */
+    private volatile boolean broken;
+
     /** 我们向服务器发送的 chunk 大小（需通过 Set Chunk Size 消息告知服务器） */
     private static final int TX_CHUNK_SIZE = 4096;
     /** 服务器默认 chunk 大小，收到 Set Chunk Size 后更新 */
@@ -48,11 +51,21 @@ public class RtmpPusher {
     private byte[] sps;
     private byte[] pps;
     private boolean headerSent = false;
+    private boolean spsPpsWarned = false;   // SPS/PPS 缺失只记一次 WARN
 
-    // 时间戳归零基准：RTMP 时间戳应从 0 开始单调递增。
+    // AAC 参数集：从首个 ADTS 帧解析得到 AudioSpecificConfig（ASC，2字节）
+    // ZLM/播放器需要先收到 AAC sequence header（FLV: 0xAF 0x00 [ASC]）才能解码后续 raw AAC
+    private byte[] aacAsc;
+    private boolean aacSeqHeaderSent = false;
+
+    // 时间戳归零基准：RTMP 时间戳从 0 开始单调递增。
     // 设备 JT1078 PTS 常为非常大的毫秒值（可能 > 2^31），直接用会导致：
     //  1) int 强转变负数；2) 超过 24bit（16.7s）后 chunk 头截断；3) 播放器花屏/卡住
-    private long firstTimestampMs = -1L;
+    //
+    // 音视频独立基准：设备可能为 A/V 使用不同 PTS 时钟（如视频用系统时间，音频用采样计数器），
+    // 共享基准会导致一个轨道的时间戳被污染。ZLM modify_stamp=2 会按相对时间处理，独立归零安全。
+    private long firstVideoTimestampMs = -1L;
+    private long firstAudioTimestampMs = -1L;
 
     public RtmpPusher(String host, int port, String app, String streamName) {
         this.host       = host;
@@ -155,8 +168,14 @@ public class RtmpPusher {
         amfString(body, "@setDataFrame");
         amfString(body, "onMetaData");
         body.write(0x08);           // ECMA array
-        writeInt32BE(body, 1);      // array count
-        amfKV(body, "videocodecid", 7.0);
+        // 必须声明 audiocodecid，否则 ZLM 把流当作"只有视频"。
+        // 后到的音频包被 "add track too late" 拒收（ZLM MediaSink.cpp:37 警告）。
+        writeInt32BE(body, 5);      // array count = 5 (videocodecid + 4 audio fields)
+        amfKV(body, "videocodecid",    7.0);  // AVC/H.264
+        amfKV(body, "audiocodecid",    7.0);  // 占位：告知 ZLM 有音频轨道
+        amfKV(body, "audiosamplerate", 8000.0);
+        amfKV(body, "audiosamplesize", 8.0);
+        amfKV(body, "stereo",          0.0);  // mono
         body.write(new byte[]{0x00, 0x00, 0x09}); // object end
         sendChunk(4, 0, MSG_DATA_AMF0, msgStreamId, body.toByteArray());
         out.flush();
@@ -236,19 +255,26 @@ public class RtmpPusher {
 
         List<byte[]> nals = parseAnnexB(annexBFrame);
         if (nals.isEmpty()) {
-            // 正常情况下不会走到这里：设备应发标准 Annex-B，首包(flag=1)带 00 00 00 01
-            // 走到这里 = 帧被截断（中间片段丢了首段）或设备发了非 Annex-B 格式
-            // 此时硬推出去只会让解码器崩花屏，直接丢弃 + hex 打印便于排查
-            String head = bytesToHex(annexBFrame, 0, Math.min(16, annexBFrame.length));
-            log.warn("Annex-B无起始码，丢弃帧 size={}B 前16B={}", annexBFrame.length, head);
-            return;
+            // 设备可能使用非标准封装（如 PT=98 厂商自定义格式、加密等），
+            // 数据不含 Annex-B 起始码（00 00 00 01 / 00 00 01），parseAnnexB 无法切分。
+            //
+            // 策略：如果 AVC sequence header 已发送，将整帧当作一个 NAL 推出去，
+            // 由解码器尝试容错（多数解码器对首位为 0xFD/0xBA 等非标准 NAL 会跳过）；
+            // 如果 header 还没发，说明连 SPS/PPS 都没有，帧无能为力，只能丢弃。
+            if (!headerSent) {
+                String head = bytesToHex(annexBFrame, 0, Math.min(16, annexBFrame.length));
+                log.warn("Annex-B无起始码且header未发送，丢弃帧 size={}B 前16B={}", annexBFrame.length, head);
+                return;
+            }
+            log.debug("非Annex-B数据，按单NAL推送 size={}B 前4B={}",
+                    annexBFrame.length, bytesToHex(annexBFrame, 0, Math.min(4, annexBFrame.length)));
+            nals = java.util.Collections.singletonList(annexBFrame);
         }
 
-        // 时间戳归零：首帧作为基准，后续全部减去它，这样 AVC header = 0，之后单调递增的小整数
-        if (firstTimestampMs < 0) firstTimestampMs = timestampMs;
-        long relativeTs = timestampMs - firstTimestampMs;
-        if (relativeTs < 0) relativeTs = 0;                 // 防御：设备 PTS 回退
-        // 24bit 上限 ≈ 4.66 小时，短流完全够用；超限硬停在上限避免 chunk header 截断伪造时间
+        // 视频独立时间戳基准
+        if (firstVideoTimestampMs < 0) firstVideoTimestampMs = timestampMs;
+        long relativeTs = timestampMs - firstVideoTimestampMs;
+        if (relativeTs < 0) relativeTs = 0;
         if (relativeTs > 0xFFFFFFL) relativeTs = 0xFFFFFFL;
 
         // 提取 SPS / PPS
@@ -262,7 +288,13 @@ public class RtmpPusher {
         // 首次推流：先发 AVC sequence header（携带 SPS/PPS），时间戳用 0
         if (!headerSent) {
             if (sps == null || pps == null) {
-                log.warn("缺少SPS/PPS，等待下一帧");
+                // 只记一次 WARN，不刷屏。当设备先发 P 帧再发 I 帧（常见于流刚建立时），
+                // 所有 P 帧正常丢弃（没有 SPS/PPS 的 AVC bitstream 解码器无法解析）。
+                // GOP 间隔内 I 帧自然到达后 header 就发出了。
+                if (!spsPpsWarned) {
+                    log.warn("缺少SPS/PPS，等待I帧到达后自动恢复(size={}B)", annexBFrame.length);
+                    spsPpsWarned = true;
+                }
                 return;
             }
             sendAvcSequenceHeader(0);
@@ -294,8 +326,8 @@ public class RtmpPusher {
         video.write(avcc.toByteArray());
 
         sendChunk(4, (int) relativeTs, MSG_VIDEO, msgStreamId, video.toByteArray());
-        out.flush();
-        log.info("RTMP视频帧 ts={}ms(raw={}) keyframe={} avcc={}B 源前16B={}",
+        safeFlush();
+        log.debug("RTMP视频帧 ts={}ms(raw={}) keyframe={} avcc={}B 源前16B={}",
                 relativeTs, timestampMs, keyframe, avcc.size(),
                 bytesToHex(annexBFrame, 0, Math.min(16, annexBFrame.length)));
     }
@@ -306,37 +338,149 @@ public class RtmpPusher {
     // FLV AudioTag 格式（首字节）：
     //   soundFormat(4) | soundRate(2) | soundSize(1) | soundType(1)
     //   soundFormat: 7=G.711A, 8=G.711U, 10=AAC
-    //   对 G.711 而言，soundRate/Size/Type 字段被解码器忽略，固定 8kHz/mono
+    // AAC: 必须先发 sequence header（[0xAF 0x00] + ASC 2B），再发 raw frame（[0xAF 0x01] + raw AAC）
+    //      ASC 由首个 ADTS 帧头解析得到（profile / sample_rate_idx / channel_cfg）
     // ======================================================
 
     public synchronized void pushAudio(byte[] data, int jtPt, long timestampMs) throws Exception {
         if (out == null) return;
         if (data == null || data.length == 0) return;
 
-        // 时间戳共用同一个基准，保证音视频同步
-        if (firstTimestampMs < 0) firstTimestampMs = timestampMs;
-        long relativeTs = timestampMs - firstTimestampMs;
+        // 音频独立时间戳基准（设备 A/V PTS 可能来自不同时钟，共享基准会污染另一方）
+        if (firstAudioTimestampMs < 0) firstAudioTimestampMs = timestampMs;
+        long relativeTs = timestampMs - firstAudioTimestampMs;
         if (relativeTs < 0) relativeTs = 0;
         if (relativeTs > 0xFFFFFFL) relativeTs = 0xFFFFFFL;
 
-        int flvAudioHeader;
         switch (jtPt) {
-            case 6:  flvAudioHeader = 0x72; break; // G.711A: soundFormat=7
-            case 7:  flvAudioHeader = 0x82; break; // G.711U: soundFormat=8
+            case 6:  pushG711(data, (int) relativeTs, 0x70); return; // G.711A
+            case 7:  pushG711(data, (int) relativeTs, 0x80); return; // G.711U
+            case 19: pushAac  (data, (int) relativeTs);       return; // AAC(ADTS)
             default:
-                log.warn("不支持的音频编码 PT={}，跳过（当前仅支持 G.711A/G.711U）", jtPt);
+                log.warn("不支持的音频编码 PT={}，跳过（当前支持 G.711A/G.711U/AAC）", jtPt);
+        }
+    }
+
+    /**
+     * G.711 推流：数据按帧长切分，每帧独立时间戳。
+     * G.711A/G.711U @8kHz 标准帧长 160B=20ms，也兼容 320B=40ms。
+     * 设备可能一个 JT1078 包里塞多帧，若全打同一时间戳 → 播放器瞬间播完 → 脉冲。
+     */
+    private void pushG711(byte[] data, int ts, int flvHeader) throws Exception {
+        // 帧长：优先 160B(20ms)，若 data 正好是 320B 的倍数则用 320B
+        int frameLen = 160;
+        int frameMs  = 20;
+        if (data.length >= 320 && data.length % 320 == 0) {
+            frameLen = 320;
+            frameMs  = 40;
+        }
+        int offset = 0;
+        int frameTs = ts;
+        while (offset < data.length) {
+            int len = Math.min(frameLen, data.length - offset);
+            byte[] body = new byte[1 + len];
+            body[0] = (byte) flvHeader;
+            System.arraycopy(data, offset, body, 1, len);
+            sendChunk(6, frameTs, MSG_AUDIO, msgStreamId, body);
+            log.debug("RTMP音频帧 ts={}ms g711 size={}B", frameTs, len);
+            offset += len;
+            frameTs += frameMs;
+        }
+        safeFlush(); // 一次 flush，减少 syscall
+    }
+
+    /**
+     * AAC 推流：JT/T 1078 通常以 ADTS 格式承载（每帧前 7B ADTS 头）。
+     * 流程：
+     *  1) 首帧解析 ADTS → 构造 ASC → 发 AAC sequence header（ts=0）
+     *  2) 之后剥掉 ADTS 头，剩余 raw AAC 数据按 [0xAF 0x01] + payload 发送
+     */
+    private void pushAac(byte[] data, int ts) throws Exception {
+        boolean isAdts = data.length >= 7
+                && (data[0] & 0xFF) == 0xFF
+                && (data[1] & 0xF0) == 0xF0;
+
+        if (!isAdts) {
+            if (!aacSeqHeaderSent) {
+                log.debug("AAC raw 但尚未取到 ASC（缺 ADTS），丢弃 size={}", data.length);
                 return;
+            }
+            sendAacRaw(data, ts);
+            return;
         }
 
-        // FLV AudioTag body = [header(1B)] [raw audio data]
-        byte[] body = new byte[1 + data.length];
-        body[0] = (byte) flvAudioHeader;
-        System.arraycopy(data, 0, body, 1, data.length);
+        // 一个 payload 里可能有多个连续 ADTS 帧，按 frame_length 切分
+        int pos = 0;
+        while (pos + 7 <= data.length) {
+            if ((data[pos] & 0xFF) != 0xFF || (data[pos + 1] & 0xF0) != 0xF0) {
+                log.debug("ADTS 帧间字节非 sync，剩余丢弃 pos={} total={}", pos, data.length);
+                return;
+            }
+            int adtsHeaderLen = ((data[pos + 1] & 0x01) == 1) ? 7 : 9;
+            int frameLength   = ((data[pos + 3] & 0x03) << 11)
+                              | ((data[pos + 4] & 0xFF) <<  3)
+                              | ((data[pos + 5] & 0xE0) >>  5);
+            if (frameLength <= adtsHeaderLen || pos + frameLength > data.length) {
+                log.debug("ADTS frame_length 异常 frameLength={} headerLen={} pos={} total={}",
+                        frameLength, adtsHeaderLen, pos, data.length);
+                return;
+            }
 
-        // 使用独立 chunk stream id（6）避免和视频(4)相互阻塞
-        sendChunk(6, (int) relativeTs, MSG_AUDIO, msgStreamId, body);
-        out.flush();
-        log.info("RTMP音频帧 ts={}ms(raw={}) pt={} size={}B", relativeTs, timestampMs, jtPt, data.length);
+            if (!aacSeqHeaderSent) {
+                aacAsc = buildAscFromAdts(Arrays.copyOfRange(data, pos, pos + 7));
+                if (aacAsc == null) return;
+                sendAacSequenceHeader(0);
+                aacSeqHeaderSent = true;
+            }
+
+            byte[] rawAac = Arrays.copyOfRange(data, pos + adtsHeaderLen, pos + frameLength);
+            sendAacRaw(rawAac, ts);
+            pos += frameLength;
+        }
+    }
+
+    private void sendAacRaw(byte[] rawAac, int ts) throws Exception {
+        byte[] body = new byte[2 + rawAac.length];
+        body[0] = (byte) 0xAF; // soundFormat=10(AAC)
+        body[1] = 0x01;        // AACPacketType: 1 = raw AAC frame
+        System.arraycopy(rawAac, 0, body, 2, rawAac.length);
+        sendChunk(6, ts, MSG_AUDIO, msgStreamId, body);
+        safeFlush();
+        log.debug("RTMP音频帧 ts={}ms aac-raw size={}B", ts, rawAac.length);
+    }
+
+    /**
+     * 从 ADTS 头解析 AudioSpecificConfig（AAC-LC，通常 2 字节）
+     *   ADTS byte2: profile(2) | sampling_freq_idx(4) | private(1) | channel_cfg_high(1)
+     *   ADTS byte3: channel_cfg_low(2) | original(1) | home(1) | copyright_id_bit(1)
+     *   ASC bits  : audioObjectType(5)=profile+1 | sampling_frequency_index(4) | channel_configuration(4) | 000(3)
+     */
+    private byte[] buildAscFromAdts(byte[] adts) {
+        int profile     = ((adts[2] & 0xC0) >> 6);
+        int sampleIdx   = ((adts[2] & 0x3C) >> 2);
+        int channelCfg  = ((adts[2] & 0x01) << 2) | ((adts[3] & 0xC0) >> 6);
+        int audioObjType = profile + 1;
+
+        if (sampleIdx > 12 || channelCfg == 0 || channelCfg > 7) {
+            log.warn("AAC ADTS 头异常 sampleIdx={} channelCfg={}", sampleIdx, channelCfg);
+            return null;
+        }
+        int b0 = ((audioObjType & 0x1F) << 3) | ((sampleIdx & 0x0E) >> 1);
+        int b1 = ((sampleIdx & 0x01) << 7) | ((channelCfg & 0x0F) << 3);
+        log.info("AAC ASC 解析 profile={} sampleIdx={} channelCfg={} ASC={}{}",
+                profile, sampleIdx, channelCfg,
+                String.format("%02X", b0), String.format("%02X", b1));
+        return new byte[]{(byte) b0, (byte) b1};
+    }
+
+    private void sendAacSequenceHeader(int timestamp) throws Exception {
+        byte[] body = new byte[2 + aacAsc.length];
+        body[0] = (byte) 0xAF; // AAC
+        body[1] = 0x00;        // AACPacketType: 0 = sequence header
+        System.arraycopy(aacAsc, 0, body, 2, aacAsc.length);
+        sendChunk(6, timestamp, MSG_AUDIO, msgStreamId, body);
+        safeFlush();
+        log.info("AAC sequence header发送完成 asc={}B ts={}", aacAsc.length, timestamp);
     }
 
     private void sendAvcSequenceHeader(int timestamp) throws Exception {
@@ -361,7 +505,7 @@ public class RtmpPusher {
         video.write(cfg.toByteArray());
 
         sendChunk(4, timestamp, MSG_VIDEO, msgStreamId, video.toByteArray());
-        out.flush();
+        safeFlush();
         log.info("AVC sequence header发送完成 sps={}B pps={}B ts={}", sps.length, pps.length, timestamp);
     }
 
@@ -369,33 +513,38 @@ public class RtmpPusher {
     // RTMP Chunk 发送
     // ======================================================
 
-    private void sendChunk(int csid, int timestamp, int msgType, int msgStreamId, byte[] data) throws Exception {
+    private void sendChunk(int csid, int timestamp, int msgType, int msgStreamId, byte[] data) throws IOException {
         int total  = data.length;
         int offset = 0;
         boolean first = true;
-        while (offset < total) {
-            int chunkLen = Math.min(TX_CHUNK_SIZE, total - offset);
-            if (first) {
-                // fmt=0: 完整消息头（11字节）
-                out.write(csid & 0x3F);                 // basic header: fmt=0
-                out.write((timestamp >> 16) & 0xFF);    // timestamp (3B)
-                out.write((timestamp >>  8) & 0xFF);
-                out.write( timestamp        & 0xFF);
-                out.write((total >> 16) & 0xFF);        // message length (3B)
-                out.write((total >>  8) & 0xFF);
-                out.write( total        & 0xFF);
-                out.write(msgType & 0xFF);              // message type (1B)
-                out.write( msgStreamId        & 0xFF);  // stream id (4B, little-endian)
-                out.write((msgStreamId >>  8) & 0xFF);
-                out.write((msgStreamId >> 16) & 0xFF);
-                out.write((msgStreamId >> 24) & 0xFF);
-                first = false;
-            } else {
-                // fmt=3: 无头，续包
-                out.write(0xC0 | (csid & 0x3F));
+        try {
+            while (offset < total) {
+                int chunkLen = Math.min(TX_CHUNK_SIZE, total - offset);
+                if (first) {
+                    // fmt=0: 完整消息头（11字节）
+                    out.write(csid & 0x3F);                 // basic header: fmt=0
+                    out.write((timestamp >> 16) & 0xFF);    // timestamp (3B)
+                    out.write((timestamp >>  8) & 0xFF);
+                    out.write( timestamp        & 0xFF);
+                    out.write((total >> 16) & 0xFF);        // message length (3B)
+                    out.write((total >>  8) & 0xFF);
+                    out.write( total        & 0xFF);
+                    out.write(msgType & 0xFF);              // message type (1B)
+                    out.write( msgStreamId        & 0xFF);  // stream id (4B, little-endian)
+                    out.write((msgStreamId >>  8) & 0xFF);
+                    out.write((msgStreamId >> 16) & 0xFF);
+                    out.write((msgStreamId >> 24) & 0xFF);
+                    first = false;
+                } else {
+                    // fmt=3: 无头，续包
+                    out.write(0xC0 | (csid & 0x3F));
+                }
+                out.write(data, offset, chunkLen);
+                offset += chunkLen;
             }
-            out.write(data, offset, chunkLen);
-            offset += chunkLen;
+        } catch (IOException e) {
+            broken = true;
+            throw e;
         }
     }
 
@@ -548,6 +697,16 @@ public class RtmpPusher {
         return 0;
     }
 
+    /** flush 输出流，若失败则标记 broken 并外抛 */
+    private void safeFlush() throws IOException {
+        try {
+            out.flush();
+        } catch (IOException e) {
+            broken = true;
+            throw e;
+        }
+    }
+
     // ======================================================
     // IO 工具
     // ======================================================
@@ -596,13 +755,23 @@ public class RtmpPusher {
     // 关闭
     // ======================================================
 
+    /** 连接是否已断（供调用方在推流前快速判断，避免每帧都触发异常） */
+    public boolean isBroken() {
+        return broken;
+    }
+
     public synchronized void close() {
+        broken = true;
         try { if (out    != null) out.close();    } catch (Exception ignored) {}
         try { if (socket != null) socket.close(); } catch (Exception ignored) {}
         out    = null;
         socket = null;
-        firstTimestampMs = -1L;
-        headerSent       = false;
+        firstVideoTimestampMs = -1L;
+        firstAudioTimestampMs = -1L;
+        headerSent            = false;
+        spsPpsWarned          = false;
+        aacSeqHeaderSent      = false;
+        aacAsc                = null;
         log.info("RTMP连接已关闭");
     }
 
